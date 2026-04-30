@@ -53,7 +53,9 @@ const INTREK_RE = /intrekken/i;
 async function loadDefaultFile() {
   setStatus('Bestand laden…');
   try {
-    const resp = await fetch('../Incidenten.xlsx');
+    // Try data/ first (works on GitHub Pages), then fall back to repo-root.
+    let resp = await fetch('data/Incidenten.xlsx');
+    if (!resp.ok) resp = await fetch('../Incidenten.xlsx');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const buf = await resp.arrayBuffer();
     parseWorkbook(buf);
