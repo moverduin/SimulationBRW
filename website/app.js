@@ -16,7 +16,35 @@ const DEFAULT_VEHICLES = {
   '093387': { label: 'HP-HA (3387)',          role: 'HP-HA', partial: 'never'  },
   '093431': { label: 'NP-TS (265)',           role: 'NP-TS', partial: 'never'  },
   '093441': { label: 'NP-TS oud (3441)',      role: 'NP-TS', partial: 'nature' },
+  // Synthetic 'replacement vehicle' codes. Used wanneer kolom Voertuigen aangeeft
+  // dat onze roepnummer (265/266/257/814) is uitgerukt, maar de body geen eigen
+  // 0933xx/0934xx code bevat — onze bemanning reed dan op een vervanger.
+  'REPL-HP-TS': { label: 'HP-TS (vervanger)', role: 'HP-TS', partial: 'never'  },
+  'REPL-NP-TS': { label: 'NP-TS (vervanger)', role: 'NP-TS', partial: 'never'  },
+  'REPL-HP-RV': { label: 'HP-RV (vervanger)', role: 'HP-RV', partial: 'never'  },
+  'REPL-HP-HA': { label: 'HP-HA (vervanger)', role: 'HP-HA', partial: 'never'  },
 };
+
+// Roepnummer → rol. Deze nummers staan in kolom 'Voertuigen' wanneer onze post
+// (Soest) is uitgerukt — onafhankelijk van het 0933xx/0934xx-codenummer in de body.
+const ROEPNR_TO_ROLE = {
+  '265': 'NP-TS',
+  '266': 'HP-TS',
+  '257': 'HP-RV',
+  '814': 'HP-HA',
+};
+const REPL_CODE_FOR_ROLE = {
+  'HP-TS': 'REPL-HP-TS',
+  'NP-TS': 'REPL-NP-TS',
+  'HP-RV': 'REPL-HP-RV',
+  'HP-HA': 'REPL-HP-HA',
+};
+
+function parseRoepnummers(s) {
+  if (!s) return [];
+  const nums = String(s).match(/\d+/g) || [];
+  return nums.filter(n => n in ROEPNR_TO_ROLE);
+}
 
 const NATURE_FIRE_RE = /\b(natuur|heide|bos|duin)/i;
 const POST_OF_ROLE = { 'HP-TS': 'HP', 'HP-RV': 'HP', 'HP-HA': 'HP', 'NP-TS': 'NP' };
@@ -100,8 +128,28 @@ function parseWorkbook(arrayBuffer) {
         seen.add(c);
         codes.push(c);
       }
-      const soest = codes.filter(c => c in vehicleConfig);
-      if (soest.length === 0) continue;
+      const soest = codes.filter(c => c in vehicleConfig && !c.startsWith('REPL-'));
+
+      // Uitruk volgens kolom Voertuigen (roepnummers 265/266/257/814 = onze posten).
+      // Per regel: voor elke rol waarvoor een roepnummer is uitgerukt maar GEEN eigen
+      // 0933xx/0934xx code in dezelfde regel-body staat, gaat onze bemanning op een
+      // vervanger. Bewust per regel — binnen één incident kan post HP (266) meerdere
+      // trucks sturen (bv. NBB 3344 én een vervanger HP-TS in een andere regel).
+      //
+      // Uitzondering: als de regel-body GEEN enkel 09xxxx-code bevat (typisch een
+      // opschalingsregel "Zeer gr. BR" / realarm) dan zijn de roepnummers in
+      // Voertuigen verwijzingen naar reeds gealarmeerde trucks — geen nieuwe dispatch.
+      const rowRoles = new Set(soest.map(c => vehicleConfig[c]?.role).filter(Boolean));
+      const replCodes = [];
+      const isUpscaleRow = codesRaw.length === 0;
+      if (!isUpscaleRow) {
+        for (const n of parseRoepnummers(r.Voertuigen)) {
+          const role = ROEPNR_TO_ROLE[n];
+          if (!rowRoles.has(role)) replCodes.push(REPL_CODE_FOR_ROLE[role]);
+        }
+      }
+      const finalCodes = [...soest, ...replCodes];
+      if (finalCodes.length === 0) continue;
 
       let dt = r.Datum;
       if (!(dt instanceof Date)) dt = new Date(dt);
@@ -117,7 +165,8 @@ function parseWorkbook(arrayBuffer) {
         location: String(r.Location ?? '').trim(),
         body,
         bodyKey: bodyAddressKey(body),
-        codes: soest,
+        codes: finalCodes,
+        dispatches: finalCodes.map(c => ({ code: c, dt })),
       });
     }
     recs.sort((a, b) => (a.datetime?.getTime() || 0) - (b.datetime?.getTime() || 0));
@@ -135,7 +184,11 @@ function parseWorkbook(arrayBuffer) {
       const sameBodyAddr = last && r.bodyKey && last.bodyKey && r.bodyKey === last.bodyKey;
       const sameIncident = sameId || (closeInTime && samePrio && (sameLoc || sameBodyAddr));
       if (sameIncident) {
-        for (const c of r.codes) if (!last.codes.includes(c)) last.codes.push(c);
+        // Behoud volgorde van alarmering: voeg de nieuwe regel’s codes/dispatches toe.
+        // Geen dedup over regels heen: post HP (266) kan in twee regels twee aparte
+        // trucks sturen (bv. NBB én een vervanger).
+        for (const c of r.codes) last.codes.push(c);
+        for (const d of r.dispatches) last.dispatches.push(d);
         last.body += ' | ' + r.body;
         last.nature = last.nature || NATURE_FIRE_RE.test(r.body);
         continue;
@@ -151,7 +204,14 @@ function parseWorkbook(arrayBuffer) {
         bodyKey: r.bodyKey,
         nature: NATURE_FIRE_RE.test(r.body),
         codes: [...r.codes],
+        dispatches: [...r.dispatches],
       });
+    }
+
+    // Sorteer dispatches per incident chronologisch (eerste alarm bovenaan).
+    for (const inc of incidents) {
+      inc.dispatches.sort((a, b) => (a.dt?.getTime() || 0) - (b.dt?.getTime() || 0));
+      inc.codes = inc.dispatches.map(d => d.code);
     }
 
     rawIncidents = incidents;
@@ -258,11 +318,13 @@ function simulateIncident(incident, s) {
   // Build alarm list in original (chronological) order from body.
   const alarms = [];
   const postsInvolved = new Set();
-  for (const code of incident.codes) {
-    const cfg = vehicleConfig[code];
+  const dispatches = incident.dispatches || incident.codes.map(c => ({ code: c, dt: incident.datetime }));
+  for (let i = 0; i < dispatches.length; i++) {
+    const d = dispatches[i];
+    const cfg = vehicleConfig[d.code];
     if (!cfg) continue;
     const isPartial = cfg.partial === 'always' || (cfg.partial === 'nature' && incident.nature);
-    const v = { code, ...cfg, isPartial, post: POST_OF_ROLE[cfg.role] };
+    const v = { code: d.code, ...cfg, isPartial, post: POST_OF_ROLE[cfg.role], dt: d.dt };
     if (v.post) postsInvolved.add(v.post);
     alarms.push(v);
   }
@@ -277,10 +339,16 @@ function simulateIncident(incident, s) {
   let firstTsHandled = false;
   let firstTsPost = null;
   let secondTsDifferentPost = false;
-  let rvAlarmed = alarms.some(a => a.role === 'HP-RV');
-  let rvStranded = false;        // (vast eerst) HP-RV alarm but RV-piket already left for NP-TS
   let rvIdleAtRuis = false;      // (huidig) HP-RV niet gealarmeerd, RV-piket zit thuis terwijl overige vrijw. opkomen
+  let rvVrijeOpkomstFlag = false; // (vast eerst) HP-RV gealarmeerd terwijl al het piket op is → vrijwilligers vullen RV
   let haCount = 0;
+
+  // Vast-eerst afspraak: als NP-TS in dezelfde uitruk staat, gaat TS-piket naar NP-TS
+  // (operationele afspraak). RV-piket kan elke HP-truck (TS/RV/HA) bemannen, want
+  // alle HP-trucks staan op hetzelfde posthuis. Daardoor is "RV zonder piket" geen
+  // werkelijke ruis als RV-piket op een andere HP-truck zit.
+  const npTsInAlarms = alarms.some(a => a.role === 'NP-TS');
+  let tsPiketAssigned = false;
 
   // Walk alarms in alarm order
   for (const v of alarms) {
@@ -292,37 +360,81 @@ function simulateIncident(incident, s) {
         firstTsPost = v.post;
         if (v.isPartial) {
           // Deelalarm: alleen piket gaat, max (dedTS - leaveBehind). Niet aanvullen
-          // met overige vrijwilligers \u2014 de TS rolt onderbemand.
-          const piketSent = Math.max(0, s.dedTS - s.leaveBehind);
-          leftBehindTS = s.dedTS - piketSent;
-          const goes = Math.min(piketSent, need);
-          tsPiketAvail = leftBehindTS;
+          // met overige vrijwilligers — de TS rolt onderbemand.
+          // In vast-eerst: als NP-TS verderop nog komt, blijft TS-piket gereserveerd
+          // voor NP-TS en gaat het deelalarm met 0 piketleden (gewoon onderbemand).
+          const reserveForNp = s.scenario === 'dedicatedFirst' && npTsInAlarms && v.role !== 'NP-TS';
+          if (!reserveForNp) {
+            const piketSent = Math.max(0, s.dedTS - s.leaveBehind);
+            leftBehindTS = s.dedTS - piketSent;
+            tsPiketAvail = leftBehindTS;
+            tsPiketAssigned = true;
+          }
           need = 0;
         } else {
-          const goes = Math.min(tsPiketAvail, need);
-          tsPiketAvail -= goes;
-          need -= goes;
-          nonPiketUsed += need;
+          if (s.scenario === 'dedicatedFirst') {
+            const tsPiketGoesHere = !tsPiketAssigned && (
+              (npTsInAlarms && v.role === 'NP-TS') ||
+              (!npTsInAlarms && v.role === 'HP-TS')
+            );
+            if (tsPiketGoesHere) {
+              const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+              tsPiketAssigned = true;
+            }
+            // RV-piket vult elke HP-truck (zelfde posthuis)
+            if (v.post === 'HP' && need > 0) {
+              const t = Math.min(rvPiketAvail, need); rvPiketAvail -= t; need -= t;
+            }
+            // Restant TS-piket (mocht designated nog niet langs zijn geweest)
+            if (need > 0) {
+              const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+            }
+            nonPiketUsed += need;
+          } else {
+            const goes = Math.min(tsPiketAvail, need);
+            tsPiketAvail -= goes;
+            need -= goes;
+            nonPiketUsed += need;
+          }
         }
         firstTsHandled = true;
       } else {
         const splitPost = v.post && firstTsPost && v.post !== firstTsPost;
         if (splitPost) secondTsDifferentPost = true;
-        // 2e TS: in alle scenario's eerst rest-TS-piket gebruiken (incl. piket dat thuis bleef)
-        let take = Math.min(tsPiketAvail, need); tsPiketAvail -= take; need -= take;
         if (s.scenario === 'dedicatedFirst') {
-          take = Math.min(rvPiketAvail, need); rvPiketAvail -= take; need -= take;
+          const tsPiketGoesHere = !tsPiketAssigned && (
+            (npTsInAlarms && v.role === 'NP-TS') ||
+            (!npTsInAlarms && v.role === 'HP-TS')
+          );
+          if (tsPiketGoesHere) {
+            const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+            tsPiketAssigned = true;
+          }
+          // RV-piket vult elke HP-truck
+          if (v.post === 'HP' && need > 0) {
+            const t = Math.min(rvPiketAvail, need); rvPiketAvail -= t; need -= t;
+          }
+          // Restant TS-piket
+          if (need > 0) {
+            const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+          }
+          nonPiketUsed += need;
+        } else {
+          // Huidig/custom: 2e TS — eerst rest-TS-piket, dan overige vrijwilligers
+          const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+          nonPiketUsed += need;
         }
-        // Huidig/custom: 2e TS gaat naar overige vrijwilligers; RV-piket blijft op de RV
-        nonPiketUsed += need;
       }
     } else if (v.role === 'HP-RV') {
       need = s.capRV;
       const take = Math.min(rvPiketAvail, need); rvPiketAvail -= take; need -= take;
       if (s.scenario === 'dedicatedFirst') {
-        // RV-piket kan al weg zijn (naar 2e TS) — dan vult TS-piket aan, anders overige vrijw.
-        if (take === 0 && rvPiketAvail === 0) rvStranded = true;
+        // RV-piket kan al weg zijn (naar HP-TS in dit incident) — dan vult TS-piket
+        // (als die nog over is) of overige vrijwilligers. Geen "stranded" flag meer:
+        // RV-piket zit altijd op HP-post als die werk had.
         const t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
+        // Vrije opkomst: er is RV-bezetting nodig, maar zowel RV- als TS-piket zijn op.
+        if (need > 0) rvVrijeOpkomstFlag = true;
       }
       nonPiketUsed += need;
     } else if (v.role === 'HP-HA') {
@@ -330,7 +442,8 @@ function simulateIncident(incident, s) {
       haCount++;
       need = haCount === 1 ? s.capHA : 2;
       if (s.scenario === 'current') {
-        const t = Math.min(leftBehindTS, need); leftBehindTS -= t; tsPiketAvail -= t; need -= t;
+        // Huidig: HA is primair voor vrije opkomst — al het piket (TS \u00e9n RV)
+        // blijft thuis, vrijwilligers vullen de HA volledig.
         nonPiketUsed += need;
       } else if (s.scenario === 'dedicatedFirst') {
         let t = Math.min(tsPiketAvail, need); tsPiketAvail -= t; need -= t;
@@ -349,16 +462,42 @@ function simulateIncident(incident, s) {
   // Huidig: RV-piket blijft thuis. Als RV niet alarmeerd én er overige vrijw. opgeroepen zijn → ruis-bron.
   if (s.scenario === 'current' && rvPiketAvail > 0 && nonPiketUsed > 0) rvIdleAtRuis = true;
 
-  // Split-post conflict (vast eerst altijd): 1e TS op andere post dan 2e TS én HP-RV ook gealarmeerd.
-  // Pas dan moet RV-piket kiezen tussen RV (HP) of NP-TS — dat is de echte ruis.
-  const splitPostConflict =
-    s.scenario === 'dedicatedFirst' &&
-    secondTsDifferentPost &&
-    rvAlarmed;
+  // ----- Eigenschap-labels (gelden in beide scenario's) -----
+  const hasHpTs = alarms.some(a => a.role === 'HP-TS');
+  const hasNpTs = alarms.some(a => a.role === 'NP-TS');
+  const hasRv   = alarms.some(a => a.role === 'HP-RV');
+
+  // Split-post: HP-TS én NP-TS gealarmeerd binnen 2 minuten van elkaar.
+  const SPLIT_WINDOW_MS = 2 * 60 * 1000;
+  let splitPost = false;
+  if (hasHpTs && hasNpTs) {
+    const hpTimes = alarms.filter(a => a.role === 'HP-TS' && a.dt).map(a => a.dt.getTime());
+    const npTimes = alarms.filter(a => a.role === 'NP-TS' && a.dt).map(a => a.dt.getTime());
+    for (const t1 of hpTimes) {
+      for (const t2 of npTimes) {
+        if (Math.abs(t1 - t2) <= SPLIT_WINDOW_MS) { splitPost = true; break; }
+      }
+      if (splitPost) break;
+    }
+  }
+
+  // RV vrije opkomst (alleen vast-eerst): HP-RV gealarmeerd terwijl al het piket
+  // (TS én RV) op is — vrijwilligers vullen de RV. Wordt in de HP-RV-branche geset.
+  // In huidig blijft RV-piket altijd thuis tot RV gealarmeerd, dus daar bestaat
+  // dit fenomeen niet.
+  const rvVrijeOpkomst = rvVrijeOpkomstFlag;
+
+  // Alleen HA: alleen HP-HA in alarmen, alle piket blijft thuis.
+  const allRoles = new Set(alarms.map(a => a.role));
+  const haOnlyIdle = allRoles.size === 1 && allRoles.has('HP-HA') && piketIdle === (s.dedTS + s.dedRV);
+
+  // NBB met 4 thuis: TS-deelalarm uitgerukt (2 TS-piket thuis) én RV-piket volledig
+  // thuis omdat RV niet gealarmeerd. Geldt in beide scenario's.
+  const nbb4Idle = leftBehindTS === 2 && !hasRv && rvPiketAvail === s.dedRV;
 
   return {
-    piketUsed, nonPiketUsed, piketIdle, conflict, splitPostConflict,
-    rvStranded, rvIdleAtRuis,
+    piketUsed, nonPiketUsed, piketIdle, conflict,
+    splitPost, rvVrijeOpkomst, haOnlyIdle, nbb4Idle, rvIdleAtRuis,
     leftBehindTS,
     posts: [...postsInvolved],
     counts: {
@@ -385,7 +524,8 @@ function runSimulation() {
   renderYearChart(main);
   renderComboChart();
   renderHourChart(main);
-  renderExamples(main);
+  const SCEN_LABELS = { current: 'Huidig', dedicatedFirst: 'Vast eerst altijd', custom: 'Aangepast' };
+  renderExamples(main, SCEN_LABELS[s.scenario] || s.scenario);
 }
 
 function setStat(name, val) {
@@ -426,17 +566,17 @@ function renderKpis(s, main, alt, altName) {
   const altConflicts = alt.filter(r => r.conflict).length;
   const nonPiket = main.reduce((a, r) => a + r.nonPiketUsed, 0);
   const altNonPiket = alt.reduce((a, r) => a + r.nonPiketUsed, 0);
-  const splitPost = main.filter(r => r.splitPostConflict).length;
-  const altSplitPost = alt.filter(r => r.splitPostConflict).length;
-  const rvStranded = main.filter(r => r.rvStranded).length;
-  const altRvStranded = alt.filter(r => r.rvStranded).length;
+  const splitPost = main.filter(r => r.splitPost).length;
+  const rvVrij = main.filter(r => r.rvVrijeOpkomst).length;
+  const haOnlyIdle = main.filter(r => r.haOnlyIdle).length;
+  const nbb4Idle = main.filter(r => r.nbb4Idle).length;
   const rvIdle = main.filter(r => r.rvIdleAtRuis).length;
 
   const labels = { current: 'Huidig', dedicatedFirst: 'Vast eerst altijd', custom: 'Aangepast' };
   const mainName = labels[s.scenario];
   const altLbl  = labels[altName];
 
-  const dConf = altConflicts - conflicts;     // positive => alt has MORE ruis
+  const dConf = altConflicts - conflicts;
   const dNon  = altNonPiket - nonPiket;
   const fmt = (n, suffix) => {
     if (n === 0) return `gelijk (${suffix})`;
@@ -451,10 +591,11 @@ function renderKpis(s, main, alt, altName) {
     <div class="kpi"><div class="num">${altConflicts}</div><div class="lbl">ruis-incidenten bij «${altLbl}» (${pct(altConflicts, total)})</div></div>
     <div class="kpi ${conflictDeltaCls}"><div class="num">${fmt(dConf, 'ruis')}</div><div class="lbl">«${altLbl}» t.o.v. «${mainName}»</div></div>
     <div class="kpi"><div class="num">${fmt(dNon, 'oproepen')}</div><div class="lbl">«${altLbl}» t.o.v. «${mainName}»</div></div>
-    <div class="kpi bad"><div class="num">${splitPost}</div><div class="lbl">split-post conflicten («Vast eerst altijd»): 2e TS staat op andere post én HP-RV gealarmeerd — RV-piket moet kiezen</div></div>
+    <div class="kpi bad"><div class="num">${splitPost}</div><div class="lbl">split-post: HP-TS én NP-TS samen gealarmeerd</div></div>
+    <div class="kpi bad"><div class="num">${rvVrij}</div><div class="lbl">RV vrije opkomst («Vast eerst»): HP-RV gealarmeerd terwijl al het piket op is</div></div>
     <div class="kpi bad"><div class="num">${rvIdle}</div><div class="lbl">RV-piket zit thuis terwijl overige vrijw. opkomen («Huidig»)</div></div>
-    <div class="kpi bad"><div class="num">${rvStranded}</div><div class="lbl">HP-RV zonder piket («Vast eerst altijd»): RV-piket vertrok eerder naar 2e TS (vaak NP)</div></div>
-    <div class="kpi"><div class="num">${altRvStranded}</div><div class="lbl">HP-RV zonder piket bij «${altLbl}»</div></div>
+    <div class="kpi bad"><div class="num">${haOnlyIdle}</div><div class="lbl">alleen HA gealarmeerd — al het piket blijft thuis</div></div>
+    <div class="kpi bad"><div class="num">${nbb4Idle}</div><div class="lbl">NBB-deelalarm: 2 TS-piket + 2 RV-piket blijven thuis</div></div>
   `;
 }
 
@@ -565,42 +706,122 @@ function renderHourChart(results) {
   });
 }
 
-function renderExamples(results) {
+// Active filter for the incidents table.
+let exampleFilter = 'all';
+
+function renderExamples(results, scenarioLabel) {
   const tbody = document.querySelector('#examples tbody');
   tbody.innerHTML = '';
-  // Ensure ascending date order
-  const idxs = results.map((_, i) => i)
-    .filter(i => results[i].conflict || results[i].splitPostConflict || results[i].rvStranded || results[i].rvIdleAtRuis)
-    .sort((a, b) => (allIncidents[a].datetime?.getTime() || 0) - (allIncidents[b].datetime?.getTime() || 0));
 
-  const frag = document.createDocumentFragment();
+  // Sort by date descending (newest first)
+  const idxs = results.map((_, i) => i)
+    .sort((a, b) => (allIncidents[b].datetime?.getTime() || 0) - (allIncidents[a].datetime?.getTime() || 0));
+
+  // Compute counts per filter
+  const counts = { all: idxs.length, ruis: 0, ok: 0,
+    splitPost: 0, rvVrijeOpkomst: 0, haOnlyIdle: 0, nbb4Idle: 0, rvIdleAtRuis: 0 };
+  const isRuisR = (r) => r.conflict || r.splitPost || r.rvVrijeOpkomst || r.rvIdleAtRuis || r.haOnlyIdle || r.nbb4Idle;
   for (const i of idxs) {
     const r = results[i];
+    if (isRuisR(r)) counts.ruis++; else counts.ok++;
+    if (r.splitPost)         counts.splitPost++;
+    if (r.rvVrijeOpkomst)    counts.rvVrijeOpkomst++;
+    if (r.haOnlyIdle)        counts.haOnlyIdle++;
+    if (r.nbb4Idle)          counts.nbb4Idle++;
+    if (r.rvIdleAtRuis)      counts.rvIdleAtRuis++;
+  }
+
+  // Update filter button counts
+  document.querySelectorAll('.examples-filters .filt').forEach(btn => {
+    const k = btn.dataset.filter;
+    const cnt = btn.querySelector('.cnt');
+    if (cnt) cnt.textContent = counts[k] ?? 0;
+    btn.classList.toggle('active', k === exampleFilter);
+  });
+
+  // Apply filter
+  const passes = (r) => {
+    switch (exampleFilter) {
+      case 'all':              return true;
+      case 'ruis':             return isRuisR(r);
+      case 'ok':               return !isRuisR(r);
+      case 'splitPost':        return r.splitPost;
+      case 'rvVrijeOpkomst':   return r.rvVrijeOpkomst;
+      case 'haOnlyIdle':       return r.haOnlyIdle;
+      case 'nbb4Idle':         return r.nbb4Idle;
+      case 'rvIdleAtRuis':     return r.rvIdleAtRuis;
+      default: return true;
+    }
+  };
+
+  const frag = document.createDocumentFragment();
+  let shown = 0;
+  for (const i of idxs) {
+    const r = results[i];
+    if (!passes(r)) continue;
     const inc = allIncidents[i];
     const tags = [];
-    if (r.splitPostConflict) tags.push('<span class="tag tag-split">split-post</span>');
-    if (r.rvStranded)        tags.push('<span class="tag tag-rv">RV zonder piket</span>');
+    if (r.splitPost)         tags.push('<span class="tag tag-split">split-post</span>');
+    if (r.rvVrijeOpkomst)    tags.push('<span class="tag tag-rvo">RV vrije opkomst</span>');
+    if (r.haOnlyIdle)        tags.push('<span class="tag tag-ha">alleen HA</span>');
+    if (r.nbb4Idle)          tags.push('<span class="tag tag-nbb">NBB — 4 piket thuis</span>');
     if (r.rvIdleAtRuis)      tags.push('<span class="tag tag-idle">RV-piket thuis</span>');
-    const reason = `${r.nonPiketUsed} overige vrijw. opgeroepen, ${r.piketIdle} piket thuis ${tags.join(' ')}`;
-    const veh = inc.codes.map(c => vehicleConfig[c]?.label || c).join(', ');
+    const isRuis = isRuisR(r);
+    const reason = isRuis
+      ? `${r.nonPiketUsed} overige vrijw. opgeroepen, ${r.piketIdle} piket thuis ${tags.join(' ')}`
+      : `<span class="muted">geen ruis (${r.nonPiketUsed} overige vrijw., ${r.piketIdle} piket thuis)</span>`;
+    const veh = renderDispatches(inc.dispatches);
+    const cleanLoc = stripVehicleCodes(inc.location);
     const tr = document.createElement('tr');
+    tr.className = isRuis ? 'row-ruis' : 'row-ok';
     tr.innerHTML = `
       <td>${inc.datetime?.toISOString().slice(0,16).replace('T',' ') ?? ''}</td>
       <td>P${inc.prio ?? '?'}</td>
       <td>${veh}</td>
       <td>${reason}</td>
-      <td>${escapeHtml(inc.location)}</td>`;
+      <td>${escapeHtml(cleanLoc)}</td>`;
     frag.appendChild(tr);
+    shown++;
   }
   tbody.appendChild(frag);
-  const note = document.querySelector('#examples')?.previousElementSibling;
-  if (note && note.classList.contains('hint')) {
-    note.textContent = `${idxs.length} ruis-incidenten in dit scenario, op datum oplopend.`;
-  }
+
+  // Scenario badge + hint
+  const badge = document.getElementById('scenarioBadge');
+  if (badge) badge.textContent = `· scenario: ${scenarioLabel}`;
+  const hint = document.getElementById('examplesHint');
+  if (hint) hint.textContent = `${shown} van ${idxs.length} incidenten getoond. Klik een filter om bij te stellen.`;
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Verwijder voertuigcodes (09xxxx) uit lokatietekst zodat alleen het adres/incidenttype overblijft.
+function stripVehicleCodes(s) {
+  return String(s || '').replace(/\b09\d{4}\b/g, '').replace(/\s+/g, ' ').trim();
+}
+
+// HH:MM van een Date.
+function fmtTime(dt) {
+  if (!(dt instanceof Date) || isNaN(dt)) return '';
+  return dt.toISOString().slice(11, 16);
+}
+
+// Toon dispatches gestapeld met alarmtijd en Δt t.o.v. de eerste alarmering.
+function renderDispatches(dispatches) {
+  if (!dispatches || dispatches.length === 0) return '';
+  const t0 = dispatches[0].dt?.getTime();
+  const lines = dispatches.map((d, idx) => {
+    const label = vehicleConfig[d.code]?.label || d.code;
+    const time = fmtTime(d.dt);
+    let delta = '';
+    if (idx > 0 && t0 != null && d.dt) {
+      const mins = Math.round((d.dt.getTime() - t0) / 60000);
+      if (mins > 0) delta = ` <span class="muted">(+${mins} min)</span>`;
+    }
+    return `<div class="dispatch"><span class="dispatch-time">${time}</span> ${escapeHtml(label)}${delta}</div>`;
+  });
+  return lines.join('');
 }
 
 // ---------- Wire UI ----------
@@ -620,6 +841,14 @@ document.querySelectorAll('input[name=scenario]').forEach(r => r.addEventListene
 for (const id of ['yearRange','prioFilter']) {
   document.getElementById(id).addEventListener('change', () => { applyFilters(); runSimulation(); });
 }
+
+// Filter knoppen voor incidententabel
+document.querySelectorAll('.examples-filters .filt').forEach(btn => {
+  btn.addEventListener('click', () => {
+    exampleFilter = btn.dataset.filter;
+    runSimulation();
+  });
+});
 
 // Auto-load default file on first paint
 window.addEventListener('DOMContentLoaded', loadDefaultFile);

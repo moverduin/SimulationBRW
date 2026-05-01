@@ -247,7 +247,10 @@ td code { font-size: .85em; }
 }
 .tag-split { background: #fff3cd; color: #8a6100; border: 1px solid #ffd400; }
 .tag-rv    { background: #fde0de; color: #8a1812; border: 1px solid #d52b1e; }
+.tag-rvo   { background: #ffe5cc; color: #8a3f00; border: 1px solid #ff7a1a; }
 .tag-idle  { background: #e3ecff; color: #002b75; border: 1px solid #003da5; }
+.tag-ha    { background: #e6f4ea; color: #1e5631; border: 1px solid #4caf50; }
+.tag-nbb   { background: #f3e5ff; color: #4a148c; border: 1px solid #8e24aa; }
 
 .legenda {
   margin: 14px 0 0; padding: 12px 14px;
@@ -256,6 +259,55 @@ td code { font-size: .85em; }
 }
 .legenda strong { display: block; margin-bottom: 4px; color: var(--brand-blue-dark); }
 .legenda .tag { margin-right: 4px; }
+
+.scenario-badge {
+  display: inline-block; margin-left: 10px;
+  font-size: .8rem; font-weight: 600;
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--brand-blue); color: #fff;
+  vertical-align: middle; letter-spacing: .3px;
+}
+
+.examples-filters {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin: 14px 0 0;
+}
+.examples-filters .filt {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 999px;
+  padding: 6px 14px; font-size: .85rem; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.examples-filters .filt:hover { background: var(--surface-2); }
+.examples-filters .filt.active {
+  background: var(--brand-blue); color: #fff; border-color: var(--brand-blue-dark);
+}
+.examples-filters .filt .cnt {
+  background: rgba(0,0,0,.08); color: inherit;
+  font-size: .75rem; font-weight: 700;
+  padding: 1px 8px; border-radius: 999px; min-width: 20px; text-align: center;
+}
+.examples-filters .filt.active .cnt { background: rgba(255,255,255,.25); }
+
+#examples tbody tr.row-ok td { color: var(--muted); }
+#examples tbody tr.row-ruis { background: #fff5f3; }
+#examples tbody tr.row-ruis:hover { background: #ffe8e3; }
+#examples tbody tr.row-ruis td:first-child {
+  border-left: 3px solid var(--brand-red);
+}
+.muted { color: var(--muted); font-style: italic; }
+
+.dispatch { white-space: nowrap; line-height: 1.45; }
+.dispatch + .dispatch { margin-top: 2px; }
+.dispatch-time {
+  display: inline-block;
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--brand-blue);
+  margin-right: 6px;
+}
 
 select, input[type="text"] {
   background: #fff; color: var(--text);

@@ -437,13 +437,25 @@
   </section>
 
   <section class="card">
-    <h2><span class="num">5</span> Ruis-incidenten in dit scenario</h2>
-    <p class="hint">Alle incidenten waar het gekozen scenario ruis veroorzaakt, op datum oplopend. Scroll voor meer.</p>
+    <h2><span class="num">5</span> Incidenten <small id="scenarioBadge" class="scenario-badge"></small></h2>
+    <p class="hint" id="examplesHint">Alle incidenten in het gefilterde tijdvak. Gebruik de knoppen om te filteren.</p>
     <div class="legenda">
       <strong>Legenda:</strong>
+      <span class="tag tag-split">split-post</span> HP-TS én NP-TS zijn samen gealarmeerd in dezelfde uitruk.
+      <span class="tag tag-rvo">RV vrije opkomst</span> Alleen «Vast eerst»: HP-RV gealarmeerd terwijl al het piket (TS én RV) al elders is ingezet — vrijwilligers vullen de RV.
+      <span class="tag tag-ha">alleen HA</span> Alleen de hulpverlening (HA) is uitgerukt; al het TS- en RV-piket blijft thuis.
+      <span class="tag tag-nbb">NBB — 4 piket thuis</span> NBB-deelalarm: 2 TS-piketleden blijven thuis en het RV-piket is niet gealarmeerd — in totaal 4 piketleden thuis.
       <span class="tag tag-idle">RV-piket thuis</span> RV-piket bleef op de kazerne terwijl overige vrijwilligers werden opgeroepen (alleen «Huidig»).
-      <span class="tag tag-split">split-post</span> 1e TS is HP en 2e TS is NP (of omgekeerd) én HP-RV is óók gealarmeerd. RV-piket moet kiezen tussen de RV en de NP-TS (alleen «Vast eerst altijd»).
-      <span class="tag tag-rv">RV zonder piket</span> HP-RV is gealarmeerd maar de RV-piket vertrok eerder met de 2e TS, dus de RV staat zonder piket-bezetting (alleen «Vast eerst altijd»).
+    </div>
+    <div class="examples-filters" role="group" aria-label="Filter incidenten">
+      <button type="button" class="filt active" data-filter="all">Alle <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="ruis">Met ruis <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="splitPost">Split-post <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="rvVrijeOpkomst">RV vrije opkomst <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="haOnlyIdle">Alleen HA <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="nbb4Idle">NBB — 4 thuis <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="rvIdleAtRuis">RV-piket thuis <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="ok">Geen ruis <span class="cnt"></span></button>
     </div>
     <div class="examples-wrap">
       <table id="examples">
