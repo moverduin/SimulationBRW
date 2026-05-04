@@ -416,23 +416,24 @@
       <div>
         <h3>Scenario</h3>
         <label class="scenario-opt"><input type="radio" name="scenario" value="current" checked>
-          <span><strong>Huidig</strong><br><small>2e TS &amp; HA → overige vrijwilligers, behalve deelalarm-thuisblijvers krijgen voorrang op HA.</small></span></label>
+          <span><strong>Huidig</strong><br><small>2e TS &amp; HA gaan naar overige vrijwilligers; al het piket blijft thuis bij solo-HA. RV-piket blijft thuis tot RV gealarmeerd is.</small></span></label>
         <label class="scenario-opt"><input type="radio" name="scenario" value="dedicatedFirst">
-          <span><strong>Vast eerst altijd</strong><br><small>Vaste piketleden hebben voorrang op élk voertuig.</small></span></label>
-        <label class="scenario-opt"><input type="radio" name="scenario" value="custom">
-          <span><strong>Aangepast</strong><br><small>Alleen 1e TS voor vaste TS-piket; rest vrij voor iedereen.</small></span></label>
+          <span><strong>Vast eerst altijd</strong><br><small>Vaste piketleden hebben voorrang op elk voertuig. TS-piket gaat per afspraak naar NP-TS als die mee-gealarmeerd is.</small></span></label>
       </div>
     </div>
   </section>
 
   <section class="card">
-    <h2><span class="num">4</span> Resultaten</h2>
-    <div id="kpis" class="kpis"></div>
+    <h2><span class="num">4</span> Resultaten — vergelijking scenario's</h2>
+    <p class="hint" id="resultsSub">De twee scenario's draaien op exact dezelfde set incidenten en bezetting. De getallen in de pillen zijn 1–1 dezelfde labels als in hoofdstuk 5 — zo zie je direct hoe vaak elk type ruis voorkomt per scenario.</p>
+
+    <div id="scenarioCompare" class="scenario-compare"></div>
+
     <div class="charts">
-      <div class="chart-wrap"><h3>Verdeling uitkomst</h3><canvas id="outcomeChart"></canvas></div>
-      <div class="chart-wrap"><h3>Per jaar</h3><canvas id="yearChart"></canvas></div>
-      <div class="chart-wrap"><h3>Top voertuigcombinaties</h3><canvas id="comboChart"></canvas></div>
-      <div class="chart-wrap"><h3>Per uur van de dag</h3><canvas id="hourChart"></canvas></div>
+      <div class="chart-wrap"><h3>Ruis-incidenten per label</h3><canvas id="labelChart"></canvas></div>
+      <div class="chart-wrap"><h3>Ruis-incidenten per jaar</h3><canvas id="yearChart"></canvas></div>
+      <div class="chart-wrap"><h3>Ruis-incidenten per uur van de dag</h3><canvas id="hourChart"></canvas></div>
+      <div class="chart-wrap"><h3>Top voertuigcombinaties (incidenten)</h3><canvas id="comboChart"></canvas></div>
     </div>
   </section>
 
@@ -444,7 +445,7 @@
       <span class="tag tag-split">split-post</span> HP-TS én NP-TS zijn samen gealarmeerd in dezelfde uitruk.
       <span class="tag tag-rvo">RV vrije opkomst</span> Alleen «Vast eerst»: HP-RV gealarmeerd terwijl al het piket (TS én RV) al elders is ingezet — vrijwilligers vullen de RV.
       <span class="tag tag-ha">alleen HA</span> Alleen de hulpverlening (HA) is uitgerukt; al het TS- en RV-piket blijft thuis.
-      <span class="tag tag-nbb">NBB — 4 piket thuis</span> NBB-deelalarm: 2 TS-piketleden blijven thuis en het RV-piket is niet gealarmeerd — in totaal 4 piketleden thuis.
+      <span class="tag tag-nbb">NBB</span> NBB-deelalarm: 2 TS-piketleden blijven thuis en het RV-piket is niet gealarmeerd — in totaal 4 piketleden thuis.
       <span class="tag tag-idle">RV-piket thuis</span> RV-piket bleef op de kazerne terwijl overige vrijwilligers werden opgeroepen (alleen «Huidig»).
     </div>
     <div class="examples-filters" role="group" aria-label="Filter incidenten">
@@ -453,7 +454,7 @@
       <button type="button" class="filt" data-filter="splitPost">Split-post <span class="cnt"></span></button>
       <button type="button" class="filt" data-filter="rvVrijeOpkomst">RV vrije opkomst <span class="cnt"></span></button>
       <button type="button" class="filt" data-filter="haOnlyIdle">Alleen HA <span class="cnt"></span></button>
-      <button type="button" class="filt" data-filter="nbb4Idle">NBB — 4 thuis <span class="cnt"></span></button>
+      <button type="button" class="filt" data-filter="nbb4Idle">NBB <span class="cnt"></span></button>
       <button type="button" class="filt" data-filter="rvIdleAtRuis">RV-piket thuis <span class="cnt"></span></button>
       <button type="button" class="filt" data-filter="ok">Geen ruis <span class="cnt"></span></button>
     </div>

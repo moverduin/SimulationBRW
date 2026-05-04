@@ -155,8 +155,8 @@ function parseWorkbook(arrayBuffer) {
       if (!(dt instanceof Date)) dt = new Date(dt);
       const prio = (PRIO_RE.exec(String(r.Prio || body)) || [])[1];
       const prioN = prio ? Number(prio) : null;
-      // P5 = oefening — uitsluiten
-      if (prioN === 5) continue;
+      // P3 = niet-spoed/service en P5 = oefening — uitsluiten
+      if (prioN === 3 || prioN === 5) continue;
 
       recs.push({
         id: r.Incidentnummer,
@@ -174,23 +174,35 @@ function parseWorkbook(arrayBuffer) {
     // Pass 2: merge consecutive rows that belong to the same incident.
     // 1. Same Incidentnummer => same incident (sterkste signaal).
     // 2. Anders: same prio + <= 30 min + (gelijke location OF gelijke address-key uit body).
+    // We zoeken terug door alle incidenten binnen het tijdvenster — niet enkel het
+    // laatste — zodat een tussenliggend ander incident (op een ander adres) de
+    // merge niet onderbreekt. Voorbeeld: Koninginnelaan 21:46 + Nieuwerhoekplein
+    // 21:46 + Koninginnelaan 21:52 moet 2 incidenten worden, niet 3.
+    const WINDOW_MS = 30 * 60 * 1000;
     const incidents = [];
     for (const r of recs) {
-      const last = incidents[incidents.length - 1];
-      const sameId = last && r.id && last.id && r.id === last.id;
-      const closeInTime = last && Math.abs((r.datetime?.getTime() || 0) - (last.datetime?.getTime() || 0)) <= 30 * 60 * 1000;
-      const samePrio = last && r.prio === last.prio;
-      const sameLoc = last && r.location && last.location && r.location.toLowerCase() === last.location.toLowerCase();
-      const sameBodyAddr = last && r.bodyKey && last.bodyKey && r.bodyKey === last.bodyKey;
-      const sameIncident = sameId || (closeInTime && samePrio && (sameLoc || sameBodyAddr));
-      if (sameIncident) {
+      let mergedInto = null;
+      for (let j = incidents.length - 1; j >= 0; j--) {
+        const cand = incidents[j];
+        const dtGap = Math.abs((r.datetime?.getTime() || 0) - (cand.datetime?.getTime() || 0));
+        const sameId = r.id && cand.id && r.id === cand.id;
+        if (dtGap > WINDOW_MS && !sameId) break; // verder terug zoeken loont niet
+        const samePrio = r.prio === cand.prio;
+        const sameLoc = r.location && cand.location && r.location.toLowerCase() === cand.location.toLowerCase();
+        const sameBodyAddr = r.bodyKey && cand.bodyKey && r.bodyKey === cand.bodyKey;
+        if (sameId || (samePrio && (sameLoc || sameBodyAddr))) {
+          mergedInto = cand;
+          break;
+        }
+      }
+      if (mergedInto) {
         // Behoud volgorde van alarmering: voeg de nieuwe regel’s codes/dispatches toe.
         // Geen dedup over regels heen: post HP (266) kan in twee regels twee aparte
         // trucks sturen (bv. NBB én een vervanger).
-        for (const c of r.codes) last.codes.push(c);
-        for (const d of r.dispatches) last.dispatches.push(d);
-        last.body += ' | ' + r.body;
-        last.nature = last.nature || NATURE_FIRE_RE.test(r.body);
+        for (const c of r.codes) mergedInto.codes.push(c);
+        for (const d of r.dispatches) mergedInto.dispatches.push(d);
+        mergedInto.body += ' | ' + r.body;
+        mergedInto.nature = mergedInto.nature || NATURE_FIRE_RE.test(r.body);
         continue;
       }
       incidents.push({
@@ -216,7 +228,7 @@ function parseWorkbook(arrayBuffer) {
 
     rawIncidents = incidents;
     const mergedDelta = recs.length - incidents.length;
-    setStatus(`${incidents.length} incidenten geladen (${incidents[0]?.year}–${incidents[incidents.length-1]?.year}). ${mergedDelta} regels samengevoegd tot 1 incident. P5 (oefeningen) uitgesloten.`);
+    setStatus(`${incidents.length} incidenten geladen (${incidents[0]?.year}–${incidents[incidents.length-1]?.year}). ${mergedDelta} regels samengevoegd tot 1 incident. P3 (service) en P5 (oefeningen) uitgesloten.`);
     applyFilters();
     renderVehicleTable();
     runSimulation();
@@ -491,9 +503,16 @@ function simulateIncident(incident, s) {
   const allRoles = new Set(alarms.map(a => a.role));
   const haOnlyIdle = allRoles.size === 1 && allRoles.has('HP-HA') && piketIdle === (s.dedTS + s.dedRV);
 
-  // NBB met 4 thuis: TS-deelalarm uitgerukt (2 TS-piket thuis) én RV-piket volledig
-  // thuis omdat RV niet gealarmeerd. Geldt in beide scenario's.
-  const nbb4Idle = leftBehindTS === 2 && !hasRv && rvPiketAvail === s.dedRV;
+  // NBB-label: er is precies 1 TS-voertuig gealarmeerd én dat is een NBB-deelalarm
+  // (093344 of 093341/3441 bij natuurbrand) én HP-RV is NIET gealarmeerd. Dan
+  // blijven 2 TS-piketleden + RV-piket thuis. Bij 2+ TS-voertuigen vertrekt al
+  // het TS-piket (deelalarm aangevuld door 2e TS) — geen NBB-label meer.
+  const tsCount = alarms.filter(a => a.role === 'HP-TS' || a.role === 'NP-TS').length;
+  const nbbCount = alarms.filter(a => (a.role === 'HP-TS' || a.role === 'NP-TS') && a.isPartial).length;
+  const nbb4Idle = tsCount === 1 && nbbCount === 1 && !hasRv && leftBehindTS > 0;
+
+  // "Alleen HA" dekt het geval al — geen extra "RV-piket thuis" label nodig.
+  if (haOnlyIdle) rvIdleAtRuis = false;
 
   return {
     piketUsed, nonPiketUsed, piketIdle, conflict,
@@ -512,19 +531,21 @@ function runSimulation() {
   if (allIncidents.length === 0) return;
   const s = getSettings();
 
-  // Run current chosen scenario AND the alternative for comparison
-  const altScenario = s.scenario === 'dedicatedFirst' ? 'current' : 'dedicatedFirst';
+  // Beide scenario's draaien altijd — zo kunnen we ze 1–1 vergelijken.
+  const sCurrent = { ...s, scenario: 'current' };
+  const sDed     = { ...s, scenario: 'dedicatedFirst' };
+  const resCurrent = allIncidents.map(inc => simulateIncident(inc, sCurrent));
+  const resDed     = allIncidents.map(inc => simulateIncident(inc, sDed));
 
-  const main = allIncidents.map(inc => simulateIncident(inc, s));
-  const alt = allIncidents.map(inc => simulateIncident(inc, { ...s, scenario: altScenario }));
+  const main = s.scenario === 'dedicatedFirst' ? resDed : resCurrent;
 
-  renderKpis(s, main, alt, altScenario);
+  renderScenarioCompare(resCurrent, resDed);
   renderScene(main);
-  renderOutcomeChart(main);
-  renderYearChart(main);
+  renderLabelChart(resCurrent, resDed);
+  renderYearChart(resCurrent, resDed);
+  renderHourChart(resCurrent, resDed);
   renderComboChart();
-  renderHourChart(main);
-  const SCEN_LABELS = { current: 'Huidig', dedicatedFirst: 'Vast eerst altijd', custom: 'Aangepast' };
+  const SCEN_LABELS = { current: 'Huidig', dedicatedFirst: 'Vast eerst altijd' };
   renderExamples(main, SCEN_LABELS[s.scenario] || s.scenario);
 }
 
@@ -560,43 +581,61 @@ function renderScene(results) {
 
 function pct(n, d) { return d === 0 ? '0%' : ((n / d) * 100).toFixed(1) + '%'; }
 
-function renderKpis(s, main, alt, altName) {
-  const total = main.length;
-  const conflicts = main.filter(r => r.conflict).length;
-  const altConflicts = alt.filter(r => r.conflict).length;
-  const nonPiket = main.reduce((a, r) => a + r.nonPiketUsed, 0);
-  const altNonPiket = alt.reduce((a, r) => a + r.nonPiketUsed, 0);
-  const splitPost = main.filter(r => r.splitPost).length;
-  const rvVrij = main.filter(r => r.rvVrijeOpkomst).length;
-  const haOnlyIdle = main.filter(r => r.haOnlyIdle).length;
-  const nbb4Idle = main.filter(r => r.nbb4Idle).length;
-  const rvIdle = main.filter(r => r.rvIdleAtRuis).length;
+// Definitie van alle ruis-labels (zelfde set + kleuren als hoofdstuk 5).
+const RUIS_LABELS = [
+  { key: 'splitPost',        text: 'split-post',          tagCls: 'tag-split', color: '#ffd400' },
+  { key: 'rvVrijeOpkomst',   text: 'RV vrije opkomst',    tagCls: 'tag-rvo',   color: '#ff7a1a' },
+  { key: 'haOnlyIdle',       text: 'alleen HA',           tagCls: 'tag-ha',    color: '#4caf50' },
+  { key: 'nbb4Idle',         text: 'NBB',                 tagCls: 'tag-nbb',   color: '#8e24aa' },
+  { key: 'rvIdleAtRuis',     text: 'RV-piket thuis',      tagCls: 'tag-idle',  color: '#003da5' },
+];
+const isRuis = (r) => r.conflict || r.splitPost || r.rvVrijeOpkomst || r.rvIdleAtRuis || r.haOnlyIdle || r.nbb4Idle;
 
-  const labels = { current: 'Huidig', dedicatedFirst: 'Vast eerst altijd', custom: 'Aangepast' };
-  const mainName = labels[s.scenario];
-  const altLbl  = labels[altName];
+function labelCounts(results) {
+  const c = { total: results.length, ruis: 0, oproepen: 0 };
+  for (const lbl of RUIS_LABELS) c[lbl.key] = 0;
+  for (const r of results) {
+    if (isRuis(r)) c.ruis++;
+    c.oproepen += r.nonPiketUsed;
+    for (const lbl of RUIS_LABELS) if (r[lbl.key]) c[lbl.key]++;
+  }
+  return c;
+}
 
-  const dConf = altConflicts - conflicts;
-  const dNon  = altNonPiket - nonPiket;
-  const fmt = (n, suffix) => {
-    if (n === 0) return `gelijk (${suffix})`;
-    return n < 0 ? `${Math.abs(n)} minder ${suffix}` : `${n} meer ${suffix}`;
+function renderScenarioCompare(resCurrent, resDed) {
+  const a = labelCounts(resCurrent);
+  const b = labelCounts(resDed);
+  const total = a.total;
+
+  const card = (name, hint, c, otherC) => {
+    const pillRows = RUIS_LABELS.map(lbl => {
+      const n = c[lbl.key];
+      const otherN = otherC[lbl.key];
+      let delta = '';
+      if (n !== otherN) {
+        const d = n - otherN;
+        const cls = d < 0 ? 'delta-good' : 'delta-bad';
+        delta = ` <span class="delta ${cls}">${d > 0 ? '+' : ''}${d}</span>`;
+      }
+      return `<li><span class="tag ${lbl.tagCls}">${lbl.text}</span><span class="pill-cnt">${n}</span>${delta}</li>`;
+    }).join('');
+    return `
+      <div class="scen-card">
+        <div class="scen-head">
+          <h3>${name}</h3>
+          <p class="scen-hint">${hint}</p>
+        </div>
+        <div class="scen-kpis">
+          <div class="scen-kpi"><div class="big">${c.ruis}</div><div class="sub">incidenten met ruis (${pct(c.ruis, total)})</div></div>
+          <div class="scen-kpi"><div class="big">${c.oproepen}</div><div class="sub">oproepen overige vrijwilligers (totaal)</div></div>
+        </div>
+        <ul class="label-pills">${pillRows}</ul>
+      </div>`;
   };
-  const conflictDeltaCls = dConf > 0 ? 'ok' : (dConf < 0 ? 'bad' : '');
 
-  document.getElementById('kpis').innerHTML = `
-    <div class="kpi"><div class="num">${total}</div><div class="lbl">incidenten geanalyseerd</div></div>
-    <div class="kpi bad"><div class="num">${conflicts}</div><div class="lbl">ruis-incidenten in scenario «${mainName}» (${pct(conflicts, total)})</div></div>
-    <div class="kpi"><div class="num">${nonPiket}</div><div class="lbl">oproepen overige vrijwilligers («${mainName}»)</div></div>
-    <div class="kpi"><div class="num">${altConflicts}</div><div class="lbl">ruis-incidenten bij «${altLbl}» (${pct(altConflicts, total)})</div></div>
-    <div class="kpi ${conflictDeltaCls}"><div class="num">${fmt(dConf, 'ruis')}</div><div class="lbl">«${altLbl}» t.o.v. «${mainName}»</div></div>
-    <div class="kpi"><div class="num">${fmt(dNon, 'oproepen')}</div><div class="lbl">«${altLbl}» t.o.v. «${mainName}»</div></div>
-    <div class="kpi bad"><div class="num">${splitPost}</div><div class="lbl">split-post: HP-TS én NP-TS samen gealarmeerd</div></div>
-    <div class="kpi bad"><div class="num">${rvVrij}</div><div class="lbl">RV vrije opkomst («Vast eerst»): HP-RV gealarmeerd terwijl al het piket op is</div></div>
-    <div class="kpi bad"><div class="num">${rvIdle}</div><div class="lbl">RV-piket zit thuis terwijl overige vrijw. opkomen («Huidig»)</div></div>
-    <div class="kpi bad"><div class="num">${haOnlyIdle}</div><div class="lbl">alleen HA gealarmeerd — al het piket blijft thuis</div></div>
-    <div class="kpi bad"><div class="num">${nbb4Idle}</div><div class="lbl">NBB-deelalarm: 2 TS-piket + 2 RV-piket blijven thuis</div></div>
-  `;
+  document.getElementById('scenarioCompare').innerHTML =
+    card('Huidig', 'Wat er nu gebeurt: 2e TS &amp; HA via overige vrijwilligers, RV-piket blijft thuis tot RV alarmed.', a, b) +
+    card('Vast eerst altijd', 'Vaste piketleden hebben voorrang op elk voertuig; TS-piket gaat per afspraak naar NP-TS.', b, a);
 }
 
 // ---------- Charts ----------
@@ -605,54 +644,66 @@ function destroyChart(key) {
   if (charts[key]) { charts[key].destroy(); delete charts[key]; }
 }
 
-function renderOutcomeChart(results) {
-  destroyChart('outcome');
-  const ctx = document.getElementById('outcomeChart');
-  const ok = results.filter(r => !r.conflict).length;
-  const bad = results.filter(r => r.conflict).length;
-  charts.outcome = new Chart(ctx, {
-    type: 'doughnut',
+function renderLabelChart(resCurrent, resDed) {
+  destroyChart('label');
+  const ctx = document.getElementById('labelChart');
+  if (!ctx) return;
+  const a = labelCounts(resCurrent);
+  const b = labelCounts(resDed);
+  charts.label = new Chart(ctx, {
+    type: 'bar',
     data: {
-      labels: ['Geen ruis', 'Ruis (piket thuis & overige vrijw. opgeroepen)'],
-      datasets: [{ data: [ok, bad], backgroundColor: ['#4caf50', '#ef5350'] }],
+      labels: RUIS_LABELS.map(l => l.text),
+      datasets: [
+        { label: 'Huidig',            data: RUIS_LABELS.map(l => a[l.key]), backgroundColor: '#003da5' },
+        { label: 'Vast eerst altijd', data: RUIS_LABELS.map(l => b[l.key]), backgroundColor: '#d52b1e' },
+      ],
     },
-    options: { plugins: { legend: { labels: { color: '#e6edf3' } } } },
+    options: {
+      indexAxis: 'y',
+      scales: {
+        x: { ticks: { color: '#1d2a3a' }, beginAtZero: true },
+        y: { ticks: { color: '#1d2a3a' } },
+      },
+      plugins: { legend: { labels: { color: '#1d2a3a' } } },
+    },
   });
 }
 
-function renderYearChart(results) {
+function renderYearChart(resCurrent, resDed) {
   destroyChart('year');
-  const byYear = {};
-  results.forEach((r, i) => {
-    const y = allIncidents[i].year;
-    if (!y) return;
-    byYear[y] ??= { ok: 0, bad: 0 };
-    if (r.conflict) byYear[y].bad++; else byYear[y].ok++;
+  const yearsSet = new Set();
+  const aBy = {}, bBy = {};
+  resCurrent.forEach((r, i) => {
+    const y = allIncidents[i].year; if (!y) return;
+    yearsSet.add(y);
+    aBy[y] = (aBy[y] || 0) + (isRuis(r) ? 1 : 0);
   });
-  const years = Object.keys(byYear).sort();
+  resDed.forEach((r, i) => {
+    const y = allIncidents[i].year; if (!y) return;
+    yearsSet.add(y);
+    bBy[y] = (bBy[y] || 0) + (isRuis(r) ? 1 : 0);
+  });
+  const years = [...yearsSet].sort();
   const ctx = document.getElementById('yearChart');
   charts.year = new Chart(ctx, {
     type: 'bar',
     data: {
       labels: years,
       datasets: [
-        { label: 'Geen ruis', data: years.map(y => byYear[y].ok), backgroundColor: '#4caf50' },
-        { label: 'Ruis',      data: years.map(y => byYear[y].bad), backgroundColor: '#ef5350' },
+        { label: 'Huidig',            data: years.map(y => aBy[y] || 0), backgroundColor: '#003da5' },
+        { label: 'Vast eerst altijd', data: years.map(y => bBy[y] || 0), backgroundColor: '#d52b1e' },
       ],
     },
     options: {
-      scales: {
-        x: { stacked: true, ticks: { color: '#8aa0b6' } },
-        y: { stacked: true, ticks: { color: '#8aa0b6' } },
-      },
-      plugins: { legend: { labels: { color: '#e6edf3' } } },
+      scales: { x: { ticks: { color: '#1d2a3a' } }, y: { ticks: { color: '#1d2a3a' }, beginAtZero: true } },
+      plugins: { legend: { labels: { color: '#1d2a3a' } } },
     },
   });
 }
 
 function renderComboChart() {
   destroyChart('combo');
-  // Build combos: sorted role tuples
   const combos = {};
   for (const inc of allIncidents) {
     const roles = inc.codes.map(c => vehicleConfig[c]?.role || 'OTHER');
@@ -669,39 +720,39 @@ function renderComboChart() {
     },
     options: {
       indexAxis: 'y',
-      scales: {
-        x: { ticks: { color: '#8aa0b6' } },
-        y: { ticks: { color: '#e6edf3' } },
-      },
-      plugins: { legend: { labels: { color: '#e6edf3' } } },
+      scales: { x: { ticks: { color: '#1d2a3a' }, beginAtZero: true }, y: { ticks: { color: '#1d2a3a' } } },
+      plugins: { legend: { labels: { color: '#1d2a3a' } } },
     },
   });
 }
 
-function renderHourChart(results) {
+function renderHourChart(resCurrent, resDed) {
   destroyChart('hour');
-  const buckets = Array.from({length: 24}, () => ({ ok: 0, bad: 0 }));
-  results.forEach((r, i) => {
+  const a = Array.from({length: 24}, () => 0);
+  const b = Array.from({length: 24}, () => 0);
+  resCurrent.forEach((r, i) => {
     const h = allIncidents[i].hour;
     if (h == null || h < 0 || h > 23) return;
-    if (r.conflict) buckets[h].bad++; else buckets[h].ok++;
+    if (isRuis(r)) a[h]++;
+  });
+  resDed.forEach((r, i) => {
+    const h = allIncidents[i].hour;
+    if (h == null || h < 0 || h > 23) return;
+    if (isRuis(r)) b[h]++;
   });
   const ctx = document.getElementById('hourChart');
   charts.hour = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: buckets.map((_, i) => String(i).padStart(2,'0')),
+      labels: a.map((_, i) => String(i).padStart(2, '0')),
       datasets: [
-        { label: 'Geen ruis', data: buckets.map(b => b.ok), backgroundColor: '#4caf50' },
-        { label: 'Ruis',      data: buckets.map(b => b.bad), backgroundColor: '#ef5350' },
+        { label: 'Huidig',            data: a, backgroundColor: '#003da5' },
+        { label: 'Vast eerst altijd', data: b, backgroundColor: '#d52b1e' },
       ],
     },
     options: {
-      scales: {
-        x: { stacked: true, ticks: { color: '#8aa0b6' } },
-        y: { stacked: true, ticks: { color: '#8aa0b6' } },
-      },
-      plugins: { legend: { labels: { color: '#e6edf3' } } },
+      scales: { x: { ticks: { color: '#1d2a3a' } }, y: { ticks: { color: '#1d2a3a' }, beginAtZero: true } },
+      plugins: { legend: { labels: { color: '#1d2a3a' } } },
     },
   });
 }
@@ -764,7 +815,7 @@ function renderExamples(results, scenarioLabel) {
     if (r.splitPost)         tags.push('<span class="tag tag-split">split-post</span>');
     if (r.rvVrijeOpkomst)    tags.push('<span class="tag tag-rvo">RV vrije opkomst</span>');
     if (r.haOnlyIdle)        tags.push('<span class="tag tag-ha">alleen HA</span>');
-    if (r.nbb4Idle)          tags.push('<span class="tag tag-nbb">NBB — 4 piket thuis</span>');
+    if (r.nbb4Idle)          tags.push('<span class="tag tag-nbb">NBB</span>');
     if (r.rvIdleAtRuis)      tags.push('<span class="tag tag-idle">RV-piket thuis</span>');
     const isRuis = isRuisR(r);
     const reason = isRuis
